@@ -6,19 +6,13 @@ Professional AI-powered code review extension for Visual Studio Code using **Goo
 
 ## ✨ Features
 
-Review Current File – Analyzes only the file currently open in the editor.
-
-Review Workspace – Scans and reviews all supported files in the project.
-
-Review Path – Reviews a specific file or folder using a relative (../) or absolute path.
-
-AI Code Suggestions – Detects bugs, bad practices, and improvement opportunities.
-
-Auto-Fix Support – Automatically applies AI-generated fixes with one click.
-
-Cancellation Support – Allows stopping a running review at any time.
-
-Secure API Key Storage – Stores Gemini API key safely using VS Code Secrets API.
+1.Review Current File – Analyzes only the file currently open in the editor.
+2.Review Workspace – Scans and reviews all supported files in the project.
+3.Review Path – Reviews a specific file or folder using a relative (../) or absolute path.
+4.AI Code Suggestions – Detects bugs, bad practices, and improvement opportunities.
+5.Auto-Fix Support – Automatically applies AI-generated fixes with one click.
+6.Cancellation Support – Allows stopping a running review at any time.
+7.Secure API Key Storage – Stores Gemini API key safely using VS Code Secrets API.
 ---
 
 ## 🛠️ Installation
