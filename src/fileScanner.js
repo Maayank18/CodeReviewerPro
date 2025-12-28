@@ -50,119 +50,158 @@ export class FileScanner {
     ];
 
     /**
-     * Check if a file should be reviewed based on configuration
+     * Convert glob-like pattern (with *, **) to a RegExp.
+     * This is a conservative converter that uses `/` as separator.
      */
-    static shouldReviewFile(filePath, languageId = '') {
-        const config = vscode.workspace.getConfiguration('aiCodeReviewer');
-        const excludePatterns = config.get('excludePatterns', FileScanner.DEFAULT_EXCLUDE_PATTERNS);
-        const includedTypes = config.get('includedFileTypes', FileScanner.DEFAULT_INCLUDED_EXTENSIONS);
+    static patternToRegex(pattern) {
+        // Normalize to forward slashes
+        let p = pattern.replace(/\\/g, '/');
 
-        // Check exclude patterns
-        for (const pattern of excludePatterns) {
-            if (FileScanner.matchPattern(filePath, pattern)) {
-                return false;
-            }
-        }
+        // Escape regex special chars, then replace glob tokens
+        // We split on '/' so '**' can be handled as full wildcard
+        const segments = p.split('/').map(seg => {
+            if (seg === '**') return '.*';
+            // escape regex special chars in segment
+            const escaped = seg.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+            // now replace '*' and '?'
+            return escaped.replace(/\\\*/g, '[^/]*').replace(/\\\?/g, '.');
+        });
 
-        // Check if file extension is included
-        const ext = path.extname(filePath).toLowerCase();
-        if (!includedTypes.includes(ext)) {
-            return false;
-        }
-
-        // Additional checks for specific files to skip
-        const fileName = path.basename(filePath).toLowerCase();
-        const skipFiles = [
-            'package-lock.json',
-            'yarn.lock',
-            'pnpm-lock.yaml',
-            '.gitignore',
-            '.eslintrc',
-            '.prettierrc'
-        ];
-
-        if (skipFiles.includes(fileName)) {
-            return false;
-        }
-
-        return true;
+        const regexString = '^' + segments.join('/') + '$';
+        return new RegExp(regexString, 'i'); // case-insensitive
     }
 
     /**
-     * Simple glob pattern matching
+     * Simple glob pattern matching applied to normalized paths.
      */
     static matchPattern(filePath, pattern) {
-        // Convert glob pattern to regex
-        const regexPattern = pattern
-            .replace(/\*\*/g, '.*')
-            .replace(/\*/g, '[^/]*')
-            .replace(/\?/g, '.')
-            .replace(/\./g, '\\.');
+        if (!pattern) return false;
+        const normalized = filePath.replace(/\\/g, '/');
+        const regex = FileScanner.patternToRegex(pattern);
+        return regex.test(normalized);
+    }
 
-        const regex = new RegExp(regexPattern);
-        return regex.test(filePath);
+    /**
+     * Check if a file should be reviewed based on configuration
+     */
+    static shouldReviewFile(filePath, languageId = '') {
+        try {
+            const config = vscode.workspace.getConfiguration('aiCodeReviewer');
+            const excludePatterns = config.get('excludePatterns', FileScanner.DEFAULT_EXCLUDE_PATTERNS);
+            const includedTypes = config.get('includedFileTypes', FileScanner.DEFAULT_INCLUDED_EXTENSIONS);
+
+            // Normalize includedTypes to lower-case extensions (ensure leading dot)
+            const normalizedIncluded = (Array.isArray(includedTypes) ? includedTypes : FileScanner.DEFAULT_INCLUDED_EXTENSIONS)
+                .map(ext => ext.toLowerCase().startsWith('.') ? ext.toLowerCase() : `.${ext.toLowerCase()}`);
+
+            // Check exclude patterns first
+            for (const pattern of excludePatterns) {
+                if (FileScanner.matchPattern(filePath, pattern)) {
+                    return false;
+                }
+            }
+
+            // Check file extension
+            const ext = (path.extname(filePath) || '').toLowerCase();
+            if (!normalizedIncluded.includes(ext)) {
+                return false;
+            }
+
+            // Skip some known non-source files by name
+            const fileName = path.basename(filePath).toLowerCase();
+            const skipFiles = new Set([
+                'package-lock.json',
+                'yarn.lock',
+                'pnpm-lock.yaml',
+                '.gitignore',
+                '.eslintrc',
+                '.prettierrc'
+            ]);
+            if (skipFiles.has(fileName)) return false;
+
+            return true;
+        } catch (err) {
+            // on error, be conservative and skip the file
+            console.warn('shouldReviewFile error:', err);
+            return false;
+        }
     }
 
     /**
      * Scan workspace for reviewable files
+     * Returns an array of file paths.
      */
     static async scanWorkspace(workspacePath, maxFiles = 50) {
-        const files = [];
-        
         try {
-            await FileScanner.scanDirectory(workspacePath, files, maxFiles);
+            // Reuse scanDirectory (it supports being called with only dirPath and returns array)
+            const files = await FileScanner.scanDirectory(workspacePath, null, maxFiles, 0);
+            return Array.isArray(files) ? files : [];
         } catch (error) {
             console.error('Error scanning workspace:', error);
+            return [];
         }
-
-        return files;
     }
 
     /**
-     * Recursively scan directory for files
+     * Recursively scan directory for files.
+     *
+     * Backwards-compatible signature:
+     * - scanDirectory(dirPath) -> returns Promise<Array<string>>
+     * - scanDirectory(dirPath, filesArray, maxFiles, depth) -> pushes into filesArray (old style)
      */
-    static async scanDirectory(dirPath, files, maxFiles, depth = 0) {
-        // Prevent too deep recursion
-        if (depth > 10 || files.length >= maxFiles) {
-            return;
-        }
+    static async scanDirectory(dirPath, files = null, maxFiles = 1000, depth = 0) {
+        // If caller provided a files array (old signature), use that; otherwise create and return results
+        const isLegacyCall = Array.isArray(files);
+        const results = isLegacyCall ? files : [];
+
+        // Safety limits
+        if (depth > 20) return isLegacyCall ? undefined : results;
 
         try {
             const entries = await fs.readdir(dirPath, { withFileTypes: true });
-
             for (const entry of entries) {
-                if (files.length >= maxFiles) {
-                    break;
-                }
+                if (results.length >= maxFiles) break;
 
                 const fullPath = path.join(dirPath, entry.name);
 
-                // Skip if matches exclude pattern
-                const shouldSkip = FileScanner.DEFAULT_EXCLUDE_PATTERNS.some(pattern => {
-                    if (pattern.includes('**')) {
-                        return FileScanner.matchPattern(fullPath, pattern);
+                // Quick skip for common heavy directories based on name
+                if (entry.isDirectory()) {
+                    const name = entry.name.toLowerCase();
+                    if (/(node_modules|\.git|dist|build|coverage|venv|\.next|\.nuxt)/i.test(name)) {
+                        continue;
                     }
-                    return entry.name === pattern.replace(/\*/g, '');
-                });
-
-                if (shouldSkip) {
-                    continue;
                 }
 
+                // Check exclude patterns (use workspace config if available)
+                const config = vscode.workspace.getConfiguration('aiCodeReviewer');
+                const excludePatterns = config.get('excludePatterns', FileScanner.DEFAULT_EXCLUDE_PATTERNS);
+
+                let shouldSkip = false;
+                for (const pattern of excludePatterns) {
+                    if (FileScanner.matchPattern(fullPath, pattern)) {
+                        shouldSkip = true;
+                        break;
+                    }
+                }
+                if (shouldSkip) continue;
+
                 if (entry.isDirectory()) {
-                    // Recursively scan subdirectory
-                    await FileScanner.scanDirectory(fullPath, files, maxFiles, depth + 1);
+                    await FileScanner.scanDirectory(fullPath, results, maxFiles, depth + 1);
                 } else if (entry.isFile()) {
-                    // Check if file should be reviewed
                     if (FileScanner.shouldReviewFile(fullPath)) {
-                        files.push(fullPath);
+                        results.push(fullPath);
                     }
                 }
             }
         } catch (error) {
-            // Skip directories we can't access
-            console.warn(`Cannot access directory: ${dirPath}`);
+            // Skip directories we can't access - log to output if possible
+            try {
+                const output = vscode.window.createOutputChannel ? vscode.window.createOutputChannel('AI Code Reviewer Scanner') : null;
+                if (output) output.appendLine(`⚠️ Cannot access directory: ${dirPath} — ${error.message}`);
+            } catch (_) { /* ignore */ }
         }
+
+        return isLegacyCall ? undefined : results;
     }
 
     /**
@@ -172,7 +211,7 @@ export class FileScanner {
         try {
             const stats = await fs.stat(filePath);
             const content = await fs.readFile(filePath, 'utf-8');
-            
+
             return {
                 path: filePath,
                 name: path.basename(filePath),
@@ -190,11 +229,17 @@ export class FileScanner {
      * Find files by pattern in workspace
      */
     static async findFiles(pattern, workspacePath) {
-        const allFiles = await FileScanner.scanWorkspace(workspacePath, 1000);
-        return allFiles.filter(file => {
-            const fileName = path.basename(file);
-            return FileScanner.matchPattern(fileName, pattern);
-        });
+        try {
+            const allFiles = await FileScanner.scanWorkspace(workspacePath, 1000);
+            // match pattern against file base name and full path for convenience
+            return allFiles.filter(file => {
+                const fileName = path.basename(file);
+                return FileScanner.matchPattern(fileName, pattern) || FileScanner.matchPattern(file, pattern);
+            });
+        } catch (err) {
+            console.warn('findFiles error:', err);
+            return [];
+        }
     }
 
     /**
@@ -228,9 +273,9 @@ export class FileScanner {
             const entries = await fs.readdir(dirPath, { withFileTypes: true });
 
             for (const entry of entries) {
-                // Skip excluded directories
+                // Skip excluded directories by name
                 if (entry.isDirectory()) {
-                    const shouldSkip = ['node_modules', '.git', 'dist', 'build'].includes(entry.name);
+                    const shouldSkip = ['node_modules', '.git', 'dist', 'build', 'coverage', 'venv', '.next', '.nuxt'].includes(entry.name);
                     if (shouldSkip) {
                         continue;
                     }
@@ -261,7 +306,7 @@ export class FileScanner {
         // Rough estimate: ~10 seconds per file
         const estimatedSeconds = files.length * 10;
         const minutes = Math.ceil(estimatedSeconds / 60);
-        
+
         if (minutes < 1) {
             return 'less than a minute';
         } else if (minutes === 1) {

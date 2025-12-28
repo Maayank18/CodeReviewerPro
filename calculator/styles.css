@@ -1,0 +1,44 @@
+/* intentionally broken css for debugging practice */
+
+@improt url('https://fonts.googleapis.com/css?family=Roboto'); /* typo in at-rule */
+
+body {
+  backgroud-color: bluu; /* misspelled property and invalid color */
+  font-family Roboto, sans-serif /* missing colon and semicolon */
+  margin: 0pxs; /* invalid unit 'pxs' */
+}
+
+#calc {
+  width: 300px
+  margin: 20px auto;
+  paddng: 10px; /* misspelled property */
+  border: 1px solid #ccc;
+}
+
+.input {
+  font-size: 18px;
+  height: 40px;
+  display: block;
+  widht: 100%; /* typo */
+}
+
+/* invalid nested selector (not valid in plain CSS) */
+.buttons {
+  display: flex;
+  gap: 10px;
+
+  .btn { /* invalid - not supported in plain CSS */
+    background: #eee;
+    border: none;
+    padding 8px 12px; /* missing colon */
+    border-radius: 4px;
+  }
+}
+
+/* conflicting selector and missing brace */
+.btn#equals {
+  background-color: green;
+  color: white;
+ 
+/* leftover stray rule */
+color: red;

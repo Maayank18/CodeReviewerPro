@@ -7,19 +7,27 @@ export class GeminiReviewer {
         this.outputChannel = outputChannel;
         this.genAI = null;
         this.model = null;
+        this.apiKey = null;
     }
 
     setApiKey(apiKey) {
-        this.genAI = new GoogleGenerativeAI(apiKey);
-        this.model = this.genAI.getGenerativeModel({ 
-            model: 'gemini-2.5-flash',
-            generationConfig: {
-                temperature: 0.7,
-                topK: 40,
-                topP: 0.95,
-                maxOutputTokens: 8192,
-            }
-        });
+        // store key and initialize client (depends on SDK)
+        this.apiKey = apiKey;
+        try {
+            this.genAI = new GoogleGenerativeAI(apiKey);
+            this.model = this.genAI.getGenerativeModel({
+                model: 'gemini-2.5-flash',
+                generationConfig: {
+                    temperature: 0.7,
+                    topK: 40,
+                    topP: 0.95,
+                    maxOutputTokens: 8192,
+                }
+            });
+        } catch (err) {
+            // SDK initialization issues should be surfaced but not crash
+            this.outputChannel && this.outputChannel.appendLine(`⚠️ Gemini init warning: ${err.message}`);
+        }
     }
 
     /**
@@ -84,13 +92,13 @@ export class GeminiReviewer {
             switch (functionName) {
                 case 'read_file':
                     return await this.readFile(args.file_path);
-                
+
                 case 'list_directory':
                     return await this.listDirectory(args.directory_path);
-                
+
                 case 'find_file':
                     return await this.findFile(args.pattern, args.directory);
-                
+
                 default:
                     return `Error: Unknown function ${functionName}`;
             }
@@ -124,19 +132,19 @@ export class GeminiReviewer {
      */
     async listDirectory(dirPath) {
         try {
-            const files = await fs.readdir(dirPath);
+            const entries = await fs.readdir(dirPath, { withFileTypes: true });
             const fileDetails = await Promise.all(
-                files.map(async (file) => {
-                    const fullPath = path.join(dirPath, file);
+                entries.map(async (entry) => {
+                    const fullPath = path.join(dirPath, entry.name);
                     try {
                         const stats = await fs.stat(fullPath);
                         return {
-                            name: file,
-                            isDirectory: stats.isDirectory(),
+                            name: entry.name,
+                            isDirectory: entry.isDirectory(),
                             size: stats.size
                         };
                     } catch {
-                        return { name: file, error: 'Cannot access' };
+                        return { name: entry.name, error: 'Cannot access' };
                     }
                 })
             );
@@ -154,22 +162,49 @@ export class GeminiReviewer {
     }
 
     /**
-     * Tool: Find files by pattern
+     * Helper: recursively walk a directory and collect file paths
+     */
+    async _walkDirectory(dir, maxFiles = 1000) {
+        const results = [];
+        async function walker(current) {
+            if (results.length >= maxFiles) return;
+            let entries;
+            try {
+                entries = await fs.readdir(current, { withFileTypes: true });
+            } catch (err) {
+                return;
+            }
+            for (const entry of entries) {
+                if (results.length >= maxFiles) break;
+                const full = path.join(current, entry.name);
+                if (entry.isDirectory()) {
+                    // skip common heavy dirs
+                    if (/(node_modules|\.git|dist|build|coverage|venv|\.next|\.nuxt)/i.test(entry.name)) continue;
+                    await walker(full);
+                } else if (entry.isFile()) {
+                    results.push(full);
+                }
+            }
+        }
+        await walker(dir);
+        return results;
+    }
+
+    /**
+     * Tool: Find files by pattern (supports simple glob * and ?)
      */
     async findFile(pattern, directory = '.') {
         try {
-            // Simple pattern matching for basic patterns
-            const files = await fs.readdir(directory, { recursive: true });
-            const matches = files.filter(file => {
-                const fileName = path.basename(file);
-                // Convert glob pattern to regex
-                const regexPattern = pattern
-                    .replace(/\*/g, '.*')
-                    .replace(/\?/g, '.');
-                const regex = new RegExp(`^${regexPattern}$`);
-                return regex.test(fileName);
-            });
-            
+            const dirToSearch = directory || '.';
+            const allFiles = await this._walkDirectory(dirToSearch, 5000);
+
+            // Convert a simple glob to regex (filename only)
+            const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+                                   .replace(/\*/g, '.*')
+                                   .replace(/\?/g, '.');
+            const regex = new RegExp(`^${escaped}$`, 'i');
+
+            const matches = allFiles.filter(f => regex.test(path.basename(f)));
             return {
                 success: true,
                 pattern: pattern,
@@ -185,14 +220,16 @@ export class GeminiReviewer {
 
     /**
      * Main code review function
+     *
+     * options: { signal } optionally accepts an AbortSignal (best-effort if underlying SDK supports it)
      */
-    async reviewCode(filePath, code) {
+    async reviewCode(filePath, code, options = {}) {
         if (!this.model) {
             throw new Error('API key not set. Please set your Gemini API key first.');
         }
 
         const fileName = path.basename(filePath);
-        const fileExt = path.extname(filePath);
+        const fileExt = path.extname(filePath) || '';
 
         const prompt = `You are an expert code reviewer. Review the following ${fileExt} file and provide:
 
@@ -209,7 +246,7 @@ ${code}
 
 If you need to check related files, imports, or project structure, use the available tools:
 - read_file(file_path): Read another file
-- list_directory(directory_path): List directory contents  
+- list_directory(directory_path): List directory contents
 - find_file(pattern, directory): Find files by pattern
 
 Provide a structured review with actionable feedback.`;
@@ -224,41 +261,40 @@ Provide a structured review with actionable feedback.`;
             let result = await chat.sendMessage(prompt);
             let response = result.response;
 
-            // Handle function calls iteratively
-            let maxIterations = 5; // Prevent infinite loops
+            // Handle function calls iteratively (best-effort)
+            let maxIterations = 6;
             let iterations = 0;
 
-            while (response.functionCalls && iterations < maxIterations) {
+            while (response && response.functionCalls && iterations < maxIterations) {
                 iterations++;
-                this.outputChannel.appendLine(`🔧 AI is using tools to analyze your code...`);
+                this.outputChannel && this.outputChannel.appendLine(`🔧 AI is using tools to analyze your code...`);
 
                 const functionCalls = response.functionCalls;
                 const functionResponses = [];
 
-                // Execute all function calls
                 for (const call of functionCalls) {
-                    this.outputChannel.appendLine(`   → Calling: ${call.name}(${JSON.stringify(call.args)})`);
+                    this.outputChannel && this.outputChannel.appendLine(`   → Calling: ${call.name}(${JSON.stringify(call.args)})`);
                     const functionResult = await this.executeToolFunction(call.name, call.args);
-                    
+
+                    // The SDK may require a different shape; we forward minimal useful data
                     functionResponses.push({
-                        functionResponse: {
-                            name: call.name,
-                            response: functionResult
-                        }
+                        name: call.name,
+                        result: functionResult
                     });
                 }
 
-                // Send function results back to model
+                // Send function results back to model (SDK specifics may vary)
                 result = await chat.sendMessage(functionResponses);
                 response = result.response;
             }
 
-            // Parse final response
-            const reviewText = response.text();
-            return this.parseReview(reviewText);
+            // Parse final response into text (SDK specifics may vary)
+            const reviewText = response && typeof response.text === 'function' ? response.text() : (response && response.content) || (typeof result === 'string' ? result : '');
+
+            return this.parseReview(String(reviewText || '').trim());
 
         } catch (error) {
-            this.outputChannel.appendLine(`❌ Review error: ${error.message}`);
+            this.outputChannel && this.outputChannel.appendLine(`❌ Review error: ${error.message}`);
             throw error;
         }
     }
@@ -275,36 +311,40 @@ Provide a structured review with actionable feedback.`;
             rawText: reviewText
         };
 
-        // Extract sections from review
+        // Extract sections from review in a best-effort manner
         const lines = reviewText.split('\n');
         let currentSection = 'summary';
-        
-        lines.forEach(line => {
+
+        for (const rawLine of lines) {
+            const line = rawLine.trim();
             const lower = line.toLowerCase();
-            
-            if (lower.includes('overall assessment') || lower.includes('summary')) {
+
+            if (!line) continue;
+
+            if (lower.includes('overall assessment') || lower.includes('summary') || lower.startsWith('overall:')) {
                 currentSection = 'summary';
-            } else if (lower.includes('issues found') || lower.includes('problems')) {
+                continue;
+            } else if (lower.includes('issues found') || lower.includes('issues:') || lower.startsWith('bugs')) {
                 currentSection = 'issues';
-            } else if (lower.includes('suggestions') || lower.includes('improvements')) {
+                continue;
+            } else if (lower.includes('suggestions') || lower.includes('improvements') || lower.startsWith('suggestion')) {
                 currentSection = 'suggestions';
+                continue;
             } else if (lower.includes('can auto-fix') || lower.includes('automatically fix')) {
-                review.canAutoFix = lower.includes('yes') || lower.includes('true');
+                if (lower.includes('yes') || lower.includes('true')) review.canAutoFix = true;
+                continue;
             }
 
-            // Add content to appropriate section
-            if (line.trim() && !lower.includes('**') && currentSection !== 'summary') {
-                if (currentSection === 'issues') {
-                    review.issues.push(line.trim());
-                } else if (currentSection === 'suggestions') {
-                    review.suggestions.push(line.trim());
-                }
-            } else if (currentSection === 'summary' && line.trim()) {
-                review.summary += line.trim() + ' ';
+            if (currentSection === 'summary') {
+                review.summary += (review.summary ? ' ' : '') + line;
+            } else if (currentSection === 'issues') {
+                review.issues.push(line);
+            } else if (currentSection === 'suggestions') {
+                review.suggestions.push(line);
             }
-        });
+        }
 
-        review.summary = review.summary.trim() || reviewText.substring(0, 200);
+        review.summary = (review.summary || '').trim() || (reviewText.substring(0, 200)).trim();
         return review;
     }
 
@@ -317,7 +357,7 @@ Provide a structured review with actionable feedback.`;
         }
 
         const fileName = path.basename(filePath);
-        const fileExt = path.extname(filePath);
+        const fileExt = path.extname(filePath) || '';
 
         const fixPrompt = `Based on the code review, generate the corrected version of this code.
 
@@ -330,25 +370,24 @@ Review Summary:
 ${review.summary}
 
 Issues to Fix:
-${review.issues.join('\n')}
+${(review.issues || []).join('\n')}
 
 Suggestions to Apply:
-${review.suggestions.join('\n')}
+${(review.suggestions || []).join('\n')}
 
 Generate the complete corrected code. Return ONLY the code, no explanations or markdown formatting.`;
 
         try {
+            // SDK specifics vary; using a best-effort generic call
             const result = await this.model.generateContent(fixPrompt);
-            const response = result.response;
-            let fixedCode = response.text();
+            const response = result && (result.response || result);
+            const text = response && typeof response.text === 'function' ? response.text() : (response && response.content) || String(response || '');
 
-            // Clean up markdown code blocks if present
-            fixedCode = fixedCode.replace(/```[a-z]*\n?/g, '').trim();
-
+            // Clean up markdown code fences if present
+            let fixedCode = text.replace(/```[a-z]*\n?/gi, '').replace(/```/g, '').trim();
             return fixedCode;
-
         } catch (error) {
-            this.outputChannel.appendLine(`❌ Fix generation error: ${error.message}`);
+            this.outputChannel && this.outputChannel.appendLine(`❌ Fix generation error: ${error.message}`);
             throw error;
         }
     }
