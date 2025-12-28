@@ -1,9 +1,9 @@
 {
   "name": "ai-code-reviewer",
-  "displayName": "AI Code Reviewer",
+  "displayName": "AI-Code-Reviewer-Pro",
   "description": "Professional AI-powered code review using Gemini API",
   "version": "1.0.0",
-  "publisher": "Mayank",
+  "publisher": "Mayank Garg",
   "repository": {
     "type": "git",
     "url": "https://github.com/Maayank18/ai-code-reviewer"
