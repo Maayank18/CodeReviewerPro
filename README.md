@@ -8,13 +8,13 @@ Analyze, review, and automatically fix code across **files, folders, or entire p
 
 ## ✨ Key Features
 
-- **Review Current File** – Analyze only the active file in the editor  
-- **Review Workspace** – Scan and review all supported files in the project  
-- **Review Any Path** – Review a file or folder using relative (`../`) or absolute paths  
-- **AI Code Suggestions** – Detect bugs, bad practices, and improvements  
-- **Auto-Fix Support** – Apply AI-generated fixes with one click  
-- **Cancel Anytime** – Stop long-running reviews instantly  
-- **Secure API Key Storage** – Gemini API key stored using VS Code Secrets API  
+- **Review Current File** — Analyze only the active file in the editor.
+- **Review Workspace** — Scan and review all supported files in the project.
+- **Review Any Path** — Review a file or folder using relative (`../`) or absolute paths.
+- **AI Code Suggestions** — Detect bugs, bad practices, and improvements.
+- **Auto-Fix Support** — Apply AI-generated fixes with one click.
+- **Cancel Anytime** — Stop long-running reviews instantly.
+- **Secure API Key Storage** — Gemini API key stored using VS Code Secrets API.
 
 ---
 
