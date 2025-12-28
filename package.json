@@ -1,0 +1,88 @@
+{
+  "name": "ai-code-reviewer",
+  "displayName": "AI Code Reviewer",
+  "description": "Professional AI-powered code review using Gemini API",
+  "version": "1.0.0",
+  "publisher": "Mayank",
+  "repository": {
+  "type": "git",
+  "url": "https://github.com/Maayank18/ai-code-reviewer"
+},
+  "type": "module",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Linters",
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onCommand:ai-code-reviewer.reviewCurrentFile",
+    "onCommand:ai-code-reviewer.reviewWorkspace",
+    "onCommand:ai-code-reviewer.setApiKey"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ai-code-reviewer.setApiKey",
+        "title": "AI Code Reviewer: Set Gemini API Key"
+      },
+      {
+        "command": "ai-code-reviewer.reviewCurrentFile",
+        "title": "AI Code Reviewer: Review Current File"
+      },
+      {
+        "command": "ai-code-reviewer.reviewWorkspace",
+        "title": "AI Code Reviewer: Review Project Files"
+      }
+    ],
+    "configuration": {
+      "title": "AI Code Reviewer",
+      "properties": {
+        "aiCodeReviewer.excludePatterns": {
+          "type": "array",
+          "default": [
+            "**/node_modules/**",
+            "**/dist/**",
+            "**/build/**",
+            "**/.env*",
+            "**/package-lock.json",
+            "**/yarn.lock",
+            "**/*.min.js",
+            "**/*.bundle.js"
+          ],
+          "description": "Patterns to exclude from code review"
+        },
+        "aiCodeReviewer.includedFileTypes": {
+          "type": "array",
+          "default": [
+            ".js",
+            ".jsx",
+            ".ts",
+            ".tsx",
+            ".html",
+            ".css",
+            ".json",
+            ".vue",
+            ".py"
+          ],
+          "description": "File extensions to include in review"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "pretest": "npm run lint",
+    "test": "node ./test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "eslint": "^8.50.0"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.1.3"
+  }
+}
