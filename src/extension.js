@@ -1,11 +1,16 @@
+// src/extension.js
 import * as vscode from 'vscode';
 import path from 'path';
 import { promises as fsp } from 'fs';
 import { GeminiReviewer } from './geminiReviewer.js';
 import { FileScanner } from './fileScanner.js';
 
+// Import the SidebarProvider from the separate file (single source of truth)
+import { SidebarProvider } from './sidebarProvider.js';
+
 let outputChannel;
 let geminiReviewer;
+let sidebarProvider = null; // ✨ NEW: Store sidebar reference for status updates
 
 // Cancellation token source for the currently running review (if any)
 let currentReviewCancellation = null;
@@ -27,9 +32,14 @@ export function activate(context) {
     cancelStatusBarItem.text = '$(debug-stop) Cancel Review';
     cancelStatusBarItem.command = 'ai-code-reviewer.cancelReview';
     cancelStatusBarItem.tooltip = 'Cancel the running code review';
-    // hidden initially - we'll show when a review is active
     cancelStatusBarItem.hide();
     context.subscriptions.push(cancelStatusBarItem);
+
+    // ✨ UPDATED: Register the sidebar provider and store reference
+    sidebarProvider = new SidebarProvider(context, context.extensionUri);
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider('aiCodeReviewer.sidebar', sidebarProvider)
+    );
 
     // Command: Set API Key
     const setApiKeyCommand = vscode.commands.registerCommand(
@@ -38,14 +48,19 @@ export function activate(context) {
             const apiKey = await vscode.window.showInputBox({
                 prompt: 'Enter your Gemini API Key',
                 password: true,
-                placeHolder: 'AIza...',
+                placeHolder: 'sk-...',
                 ignoreFocusOut: true
             });
 
-            if (apiKey) {
-                await context.secrets.store('gemini-api-key', apiKey);
-                vscode.window.showInformationMessage('✅ Gemini API Key saved securely!');
-                geminiReviewer.setApiKey(apiKey);
+            if (apiKey !== undefined) {
+                if (apiKey === '') {
+                    await context.secrets.delete('gemini-api-key');
+                    vscode.window.showInformationMessage('✅ Gemini API Key cleared.');
+                } else {
+                    await context.secrets.store('gemini-api-key', apiKey);
+                    vscode.window.showInformationMessage('✅ Gemini API Key saved securely!');
+                    geminiReviewer.setApiKey(apiKey);
+                }
             }
         }
     );
@@ -55,12 +70,10 @@ export function activate(context) {
         'ai-code-reviewer.reviewCurrentFile',
         async () => {
             const editor = vscode.window.activeTextEditor;
-            
             if (!editor) {
                 vscode.window.showWarningMessage('No active file to review');
                 return;
             }
-
             await reviewFile(editor.document, context);
         }
     );
@@ -73,36 +86,38 @@ export function activate(context) {
         }
     );
 
-    // Command: Review a specific file or directory (supports ../ relative paths and absolute paths)
+    // Command: Review a specific file or directory (supports optional argument from sidebar)
     const reviewPathCommand = vscode.commands.registerCommand(
         'ai-code-reviewer.reviewPath',
-        async () => {
+        async (inputPathArg) => {
             try {
                 const workspaceFolders = vscode.workspace.workspaceFolders;
                 const workspaceRoot = workspaceFolders && workspaceFolders[0] ? workspaceFolders[0].uri.fsPath : undefined;
 
-                // Let user choose typing a path or selecting via dialog
-                const choice = await vscode.window.showQuickPick(['Type path', 'Pick via dialog'], {
-                    placeHolder: 'Choose how to select the path to review'
-                });
-                if (!choice) return;
+                // If an arg was provided (from sidebar), use it; otherwise ask user
+                let inputPath = inputPathArg;
+                if (!inputPath) {
+                    const choice = await vscode.window.showQuickPick(['Type path', 'Pick via dialog'], {
+                        placeHolder: 'Choose how to select the path to review'
+                    });
+                    if (!choice) return;
 
-                let inputPath;
-                if (choice === 'Type path') {
-                    inputPath = await vscode.window.showInputBox({
-                        prompt: 'Enter a file or directory path (relative to workspace or absolute). You can use ../ to go up.',
-                        placeHolder: 'src/index.js or ../other-project/src'
-                    });
-                    if (!inputPath) return;
-                } else {
-                    const uris = await vscode.window.showOpenDialog({
-                        canSelectFiles: true,
-                        canSelectFolders: true,
-                        canSelectMany: false,
-                        defaultUri: workspaceRoot ? vscode.Uri.file(workspaceRoot) : undefined
-                    });
-                    if (!uris || uris.length === 0) return;
-                    inputPath = uris[0].fsPath;
+                    if (choice === 'Type path') {
+                        inputPath = await vscode.window.showInputBox({
+                            prompt: 'Enter a file or directory path (relative to workspace or absolute). You can use ../ to go up.',
+                            placeHolder: 'src/index.js or ../other-project/src'
+                        });
+                        if (!inputPath) return;
+                    } else {
+                        const uris = await vscode.window.showOpenDialog({
+                            canSelectFiles: true,
+                            canSelectFolders: true,
+                            canSelectMany: false,
+                            defaultUri: workspaceRoot ? vscode.Uri.file(workspaceRoot) : undefined
+                        });
+                        if (!uris || uris.length === 0) return;
+                        inputPath = uris[0].fsPath;
+                    }
                 }
 
                 // Resolve path relative to workspace if not absolute
@@ -129,6 +144,11 @@ export function activate(context) {
                 try {
                     const stat = await fsp.stat(resolvedPath);
                     if (stat.isDirectory()) {
+                        // ✨ ADDED: Notify sidebar review started
+                        if (sidebarProvider) {
+                            sidebarProvider.updateReviewStatus(true);
+                        }
+
                         outputChannel.clear();
                         outputChannel.show(true);
                         outputChannel.appendLine('='.repeat(80));
@@ -140,12 +160,10 @@ export function activate(context) {
                         let files = [];
                         if (typeof FileScanner.scanDirectory === 'function') {
                             try {
-                                // support new signature (returns array) or legacy signature that pushes into an array
                                 const maybe = await FileScanner.scanDirectory(resolvedPath);
                                 if (Array.isArray(maybe)) {
                                     files = maybe;
                                 } else {
-                                    // fallback: call legacy style
                                     files = [];
                                     await FileScanner.scanDirectory(resolvedPath, files, 1000, 0);
                                 }
@@ -156,22 +174,23 @@ export function activate(context) {
                         }
 
                         if (files.length === 0) {
-                            // Fallback scanner (respects FileScanner.shouldReviewFile)
                             const maxFiles = 1000;
                             files = await scanDirectoryFallback(resolvedPath, maxFiles);
                         }
 
                         if (files.length === 0) {
                             vscode.window.showInformationMessage('No files found to review in the specified directory.');
+                            // ✨ ADDED: Update sidebar on early exit
+                            if (sidebarProvider) {
+                                sidebarProvider.updateReviewStatus(false);
+                            }
                             return;
                         }
 
-                        // Create cancellation token source for this run
                         const cts = new vscode.CancellationTokenSource();
                         currentReviewCancellation = cts;
                         cancelStatusBarItem.show();
 
-                        // Review each discovered file with progress and cancellation support (with apply fixes)
                         let reviewedCount = 0;
                         let applyAll = false;
                         await vscode.window.withProgress({
@@ -192,7 +211,6 @@ export function activate(context) {
                                     outputChannel.appendLine('-'.repeat(80));
                                     const code = document.getText();
 
-                                    // Respect cancellation point before calling API
                                     if (token.isCancellationRequested || cts.token.isCancellationRequested) {
                                         outputChannel.appendLine('Cancellation requested before sending to API.');
                                         break;
@@ -201,7 +219,6 @@ export function activate(context) {
                                     const review = await geminiReviewer.reviewCode(filePath, code);
                                     outputChannel.appendLine(review.summary || String(review));
 
-                                    // Print suggestions if any
                                     if (review.suggestions && review.suggestions.length > 0) {
                                         outputChannel.appendLine('\n💡 SUGGESTIONS:\n');
                                         review.suggestions.forEach((s, idx) => {
@@ -209,12 +226,10 @@ export function activate(context) {
                                         });
                                     }
 
-                                    // ✅ unified auto-fix detection (use suggestions OR explicit flag)
                                     const autoFixAvailable =
                                         review.canAutoFix ||
                                         (Array.isArray(review.suggestions) && review.suggestions.length > 0);
 
-                                    // Prompt to apply fixes if available
                                     if (autoFixAvailable) {
                                         let applyChoice = null;
                                         if (!applyAll) {
@@ -256,10 +271,14 @@ export function activate(context) {
                             }
                         });
 
-                        // Clean up cancellation state
                         cts.dispose();
                         currentReviewCancellation = null;
                         cancelStatusBarItem.hide();
+
+                        // ✨ ADDED: Notify sidebar review complete
+                        if (sidebarProvider) {
+                            sidebarProvider.updateReviewStatus(false);
+                        }
 
                         outputChannel.appendLine('\n' + '='.repeat(80));
                         outputChannel.appendLine(`✅ Review complete! Reviewed ${reviewedCount} files (or fewer if skipped).`);
@@ -267,17 +286,24 @@ export function activate(context) {
                         vscode.window.showInformationMessage(`✅ Reviewed ${reviewedCount} files from the selected path. Check output panel for details.`);
                     } else if (stat.isFile()) {
                         const document = await vscode.workspace.openTextDocument(vscode.Uri.file(resolvedPath));
-                        // reuse single-file review (which shows suggestions and apply-fix prompt)
                         await reviewFile(document, context);
                     } else {
                         vscode.window.showErrorMessage('The specified path is neither a file nor a directory.');
                     }
                 } catch (err) {
                     vscode.window.showErrorMessage(`Cannot access path: ${err.message}`);
+                    // ✨ ADDED: Update sidebar on error
+                    if (sidebarProvider) {
+                        sidebarProvider.updateReviewStatus(false);
+                    }
                 }
             } catch (err) {
                 vscode.window.showErrorMessage(`Review Path failed: ${err.message}`);
                 outputChannel.appendLine(`❌ ERROR (reviewPath): ${err.stack || err.message}`);
+                // ✨ ADDED: Update sidebar on error
+                if (sidebarProvider) {
+                    sidebarProvider.updateReviewStatus(false);
+                }
             }
         }
     );
@@ -288,6 +314,10 @@ export function activate(context) {
             try {
                 currentReviewCancellation.cancel();
                 vscode.window.showInformationMessage('Review cancellation requested.');
+                // ✨ ADDED: Update sidebar when review cancelled
+                if (sidebarProvider) {
+                    sidebarProvider.updateReviewStatus(false);
+                }
             } catch (err) {
                 vscode.window.showErrorMessage('Failed to cancel review.');
             }
@@ -336,11 +366,16 @@ async function reviewFile(document, context) {
 
         const filePath = document.uri.fsPath;
         const fileName = filePath.split(/[\\/]/).pop();
-        
+
         // Check if file should be excluded
         if (!FileScanner.shouldReviewFile(filePath, document.languageId)) {
             vscode.window.showInformationMessage(`Skipping ${fileName} (excluded file type)`);
             return;
+        }
+
+        // ✨ ADDED: Notify sidebar review started
+        if (sidebarProvider) {
+            sidebarProvider.updateReviewStatus(true);
         }
 
         outputChannel.clear();
@@ -350,12 +385,10 @@ async function reviewFile(document, context) {
         outputChannel.appendLine('='.repeat(80));
         outputChannel.appendLine('');
 
-        // Create cancellation token source for this run
         const cts = new vscode.CancellationTokenSource();
         currentReviewCancellation = cts;
         cancelStatusBarItem.show();
 
-        // Show progress — cancellable
         await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: `Reviewing ${fileName}...`,
@@ -365,7 +398,6 @@ async function reviewFile(document, context) {
 
             const code = document.getText();
 
-            // honor cancellation before sending to API
             if (token.isCancellationRequested || cts.token.isCancellationRequested) {
                 outputChannel.appendLine('⚠️ Review cancelled before sending to API.');
                 return;
@@ -373,7 +405,6 @@ async function reviewFile(document, context) {
 
             const review = await geminiReviewer.reviewCode(filePath, code);
 
-            // honor cancellation after API call as well
             if (token.isCancellationRequested || cts.token.isCancellationRequested) {
                 outputChannel.appendLine('⚠️ Review cancelled after receiving response.');
                 return;
@@ -381,10 +412,9 @@ async function reviewFile(document, context) {
 
             progress.report({ increment: 100 });
 
-            // Display review results
             outputChannel.appendLine('📋 REVIEW RESULTS:\n');
             outputChannel.appendLine(review.summary || review);
-            
+
             if (review.suggestions && review.suggestions.length > 0) {
                 outputChannel.appendLine('\n💡 SUGGESTIONS:\n');
                 review.suggestions.forEach((suggestion, index) => {
@@ -392,7 +422,6 @@ async function reviewFile(document, context) {
                 });
             }
 
-            // ✅ unified auto-fix detection for single-file flow
             const autoFixAvailable =
                 review.canAutoFix ||
                 (Array.isArray(review.suggestions) && review.suggestions.length > 0);
@@ -413,18 +442,28 @@ async function reviewFile(document, context) {
             }
         });
 
-        // cleanup cancellation state
         try { cts.dispose(); } catch (_) {}
         currentReviewCancellation = null;
         cancelStatusBarItem.hide();
 
+        // ✨ ADDED: Notify sidebar review complete
+        if (sidebarProvider) {
+            sidebarProvider.updateReviewStatus(false);
+        }
+
     } catch (error) {
         outputChannel.appendLine(`\n❌ ERROR: ${error.message}`);
         vscode.window.showErrorMessage(`Review failed: ${error.message}`);
+        
         if (currentReviewCancellation) {
             try { currentReviewCancellation.dispose(); } catch (_) {}
             currentReviewCancellation = null;
             cancelStatusBarItem.hide();
+        }
+
+        // ✨ ADDED: Update sidebar on error
+        if (sidebarProvider) {
+            sidebarProvider.updateReviewStatus(false);
         }
     }
 }
@@ -448,14 +487,13 @@ async function applyFixesToFile(document, review, context) {
                 review
             );
 
-            // Apply the edit
             const edit = new vscode.WorkspaceEdit();
             const fullRange = new vscode.Range(
                 document.positionAt(0),
                 document.positionAt(document.getText().length)
             );
             edit.replace(document.uri, fullRange, fixedCode);
-            
+
             await vscode.workspace.applyEdit(edit);
             await document.save();
 
@@ -495,14 +533,35 @@ async function reviewWorkspace(context) {
             return;
         }
 
+        // ✨ ADDED: Notify sidebar review started
+        if (sidebarProvider) {
+            sidebarProvider.updateReviewStatus(true);
+        }
+
         outputChannel.clear();
         outputChannel.show(true);
 
-        // Scan for files
-        const files = await FileScanner.scanWorkspace(workspaceFolders[0].uri.fsPath);
-        
+        // If FileScanner exposes scanWorkspace, use it; otherwise, fallback
+        let files = [];
+        if (typeof FileScanner.scanWorkspace === 'function') {
+            try {
+                files = await FileScanner.scanWorkspace(workspaceFolders[0].uri.fsPath);
+            } catch (err) {
+                outputChannel.appendLine(`⚠️ FileScanner.scanWorkspace failed: ${err.message}. Falling back.`);
+                files = [];
+            }
+        }
+
+        if (!files || files.length === 0) {
+            files = await scanDirectoryFallback(workspaceFolders[0].uri.fsPath, 2000);
+        }
+
         if (files.length === 0) {
             vscode.window.showInformationMessage('No files found to review');
+            // ✨ ADDED: Update sidebar on early exit
+            if (sidebarProvider) {
+                sidebarProvider.updateReviewStatus(false);
+            }
             return;
         }
 
@@ -511,14 +570,12 @@ async function reviewWorkspace(context) {
         outputChannel.appendLine('='.repeat(80));
         outputChannel.appendLine('');
 
-        // Create cancellation token source for this run
         const cts = new vscode.CancellationTokenSource();
         currentReviewCancellation = cts;
         cancelStatusBarItem.show();
 
-        // Review each file (with suggestions + apply-fixes support)
         let reviewedCount = 0;
-        let applyAll = false; // if user chooses "Apply All" we auto-apply for remaining files
+        let applyAll = false;
         await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: `Reviewing ${files.length} files...`,
@@ -531,25 +588,23 @@ async function reviewWorkspace(context) {
                 }
 
                 const file = files[i];
-                
+
                 try {
                     const document = await vscode.workspace.openTextDocument(file);
                     const code = document.getText();
-                    
+
                     outputChannel.appendLine(`\n📁 File ${i + 1}/${files.length}: ${file.split(/[\\/]/).pop()}`);
                     outputChannel.appendLine('-'.repeat(80));
-                    
-                    // Cancellation check before sending
+
                     if (token.isCancellationRequested || cts.token.isCancellationRequested) {
                         outputChannel.appendLine('Cancellation requested before sending to API.');
                         break;
                     }
 
                     const review = await geminiReviewer.reviewCode(file, code);
-                    // Print summary (same as before)
+
                     outputChannel.appendLine(review.summary || String(review));
 
-                    // Print suggestions (if any)
                     if (review.suggestions && review.suggestions.length > 0) {
                         outputChannel.appendLine('\n💡 SUGGESTIONS:\n');
                         review.suggestions.forEach((suggestion, idx) => {
@@ -557,12 +612,10 @@ async function reviewWorkspace(context) {
                         });
                     }
 
-                    // unified auto-fix detection
                     const autoFixAvailable =
                         review.canAutoFix ||
                         (Array.isArray(review.suggestions) && review.suggestions.length > 0);
 
-                    // If auto-fix possible, prompt the user (or auto-apply if they chose Apply All)
                     if (autoFixAvailable) {
                         let applyChoice = null;
                         if (!applyAll) {
@@ -573,7 +626,6 @@ async function reviewWorkspace(context) {
                                 'Apply All'
                             );
                         } else {
-                            // if applyAll already enabled, emulate Apply Fixes
                             applyChoice = 'Apply Fixes';
                         }
 
@@ -605,26 +657,34 @@ async function reviewWorkspace(context) {
             }
         });
 
-        // Clean up cancellation state
         cts.dispose();
         currentReviewCancellation = null;
         cancelStatusBarItem.hide();
 
+        // ✨ ADDED: Notify sidebar review complete
+        if (sidebarProvider) {
+            sidebarProvider.updateReviewStatus(false);
+        }
+
         outputChannel.appendLine('\n' + '='.repeat(80));
         outputChannel.appendLine(`✅ Review complete! Reviewed ${reviewedCount} files.`);
         outputChannel.appendLine('='.repeat(80));
-        
+
         vscode.window.showInformationMessage(`✅ Reviewed ${reviewedCount} files. Check output panel for details.`);
 
     } catch (error) {
         vscode.window.showErrorMessage(`Workspace review failed: ${error.message}`);
         outputChannel.appendLine(`\n❌ ERROR: ${error.message}`);
 
-        // clear cancel state if any error
         if (currentReviewCancellation) {
             try { currentReviewCancellation.dispose(); } catch (_) {}
             currentReviewCancellation = null;
             cancelStatusBarItem.hide();
+        }
+
+        // ✨ ADDED: Update sidebar on error
+        if (sidebarProvider) {
+            sidebarProvider.updateReviewStatus(false);
         }
     }
 }
@@ -649,7 +709,6 @@ async function scanDirectoryFallback(dirPath, maxFiles = 1000) {
             const full = path.join(currentPath, entry.name);
             try {
                 if (entry.isDirectory()) {
-                    // Basic skip for common heavy directories
                     if (/(node_modules|\.git|dist|build)/i.test(entry.name)) {
                         continue;
                     }
